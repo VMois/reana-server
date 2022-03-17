@@ -56,6 +56,106 @@ class ParsedUrl:
         self.netloc = self._parsed_url.netloc
         self.scheme = self._parsed_url.scheme
 
+    def name(self) -> str:
+        workflow_name = None
+        if self.basename in WORKFLOW_SPEC_FILENAMES:
+            # We omit the name of the specification file if it is standard
+            # (e.g. `reana.yaml` or `reana.yml`)
+            workflow_name = self._clean_workflow_name(self.dirname)
+        if not workflow_name:
+            workflow_name = self._clean_workflow_name(
+                f"{self.dirname}-{self.basename_without_extension}"
+            )
+        return workflow_name
+
+    @staticmethod
+    def _clean_workflow_name(name: str) -> str:
+        """Replace invalid characters in the provided workflow name with dashes.
+
+        :param name: Workflow name to be cleaned.
+        :returns: Prettified workflow name.
+        """
+        return REGEX_CHARS_TO_REPLACE.sub("-", name).strip("-")
+
+    def get_param(self, key: str) -> Optional[str]:
+        return None
+
+
+class GitHubParsedUrl(ParsedUrl):
+    def __init__(self, url: str):
+        """Parse a GitHub URL and create ParsedUrl object."""
+        # There are four different GitHub URLs:
+        # 1. URL to a repository: /<user>/<repo>
+        # 2. URL to a branch/commit: /<user>/<repo>/tree/<git_ref>
+        # 3. URL to a specific folder: /<user>/<repo>/tree/<git_ref>/<path_to_dir>
+        # 4. URL to a specific file: /<user>/<repo>/blob/<git_ref>/<path_to_file>
+        # 5. URL to a zip file: /<user>/<repo>/archive/refs/heads/<git_ref>.zip
+
+        # We are interested in five components: username, repository, tree/blob, git_ref, path
+
+        parsed_url = ParsedUrl(url)
+        url_path_components = ["username", "repository", "github_url_type", "path"]
+        split_url_path = parsed_url.path.strip("/").split(
+            "/", maxsplit=len(url_path_components) - 1
+        )
+        components = dict(zip(url_path_components, split_url_path))
+
+        username = components.get("username")
+        repository = components.get("repository")
+        github_url_type = components.get("github_url_type")
+        path = components.get("path")
+
+        if not username:
+            raise ValueError("Username not provided in GitHub URL")
+        if not repository:
+            raise ValueError("Repository not provided in GitHub URL")
+        if not github_url_type and not path:
+            pass # we are dealing with URL to a repository: /<user>/<repo>
+        elif github_url_type not in ["tree", "blob", "archive"]:
+            raise ValueError("Malformed GitHub URL")
+        elif github_url_type == "archive" and not path:
+
+
+        self.git_ref = components.get("git_ref")
+        path = components.get("path")
+
+        if not username:
+            raise ValueError("Username not provided in GitHub URL")
+        if not repository:
+            raise ValueError("Repository not provided in GitHub URL")
+        if tree_or_blob_or_archive and tree_or_blob_or_archive not in ["tree", "blob", "archive"]:
+            raise ValueError("Malformed GitHub URL")
+
+        if tree_or_blob_or_archive == "archive":
+            split_url_path = parsed_url.path.split("archive/refs/heads/")
+            self.git_ref = parsed_url.basename_without_extension
+
+        if tree_or_blob_or_archive and not self.git_ref:
+            raise ValueError("Branch or commit ID not provided in GitHub URL")
+        if tree_or_blob == "blob":
+            raise ValueError(
+                "GitHub URL points directly to a file. "
+                "Use the 'spec' argument to specify a particular specification file"
+            )
+        if tree_or_blob == "tree" and path:
+            raise ValueError("GitHub URL points to a directory")
+
+        super().__init__(url)
+
+    def name(self) -> str:
+        repository_name = self.basename_without_extension
+        if self.git_ref:
+            workflow_name = f"{repository_name}-{self.git_ref}"
+        else:
+            workflow_name = repository_name
+        return self._clean_workflow_name(workflow_name)
+
+    def get_param(self, key: str) -> Optional[str]:
+        if key == "git_ref":
+            return self.git_ref
+        else:
+            return None
+
 
 class WorkflowFetcherBase(ABC):
     """Fetch the specification of a workflow."""
@@ -78,22 +178,12 @@ class WorkflowFetcherBase(ABC):
         """Fetch the workflow specification."""
         pass
 
-    @abstractmethod
     def generate_workflow_name(self) -> str:
         """Generate a workflow name from the given URL.
 
         :returns: Generated workflow name.
         """
-        pass
-
-    @staticmethod
-    def _clean_workflow_name(name: str) -> str:
-        """Replace invalid characters in the provided workflow name with dashes.
-
-        :param name: Workflow name to be cleaned.
-        :returns: Prettified workflow name.
-        """
-        return REGEX_CHARS_TO_REPLACE.sub("-", name).strip("-")
+        return self._parsed_url.name()
 
     @staticmethod
     def _download_file(url: str, output_path: str):
@@ -214,7 +304,6 @@ class WorkflowFetcherGit(WorkflowFetcherBase):
         self,
         parsed_url: ParsedUrl,
         output_dir: str,
-        git_ref: Optional[str] = None,
         spec: Optional[str] = None,
     ):
         """Initialize the workflow specification fetcher.
@@ -225,7 +314,7 @@ class WorkflowFetcherGit(WorkflowFetcherBase):
         :param spec: Optional path to the workflow specification.
         """
         super().__init__(parsed_url, output_dir, spec)
-        self._git_ref = git_ref
+        self._git_ref = parsed_url
 
     def fetch(self) -> None:
         """Fetch workflow specification from a Git repository."""
@@ -236,21 +325,6 @@ class WorkflowFetcherGit(WorkflowFetcherBase):
             repository.remote().fetch(self._git_ref, depth=1)
             repository.git.checkout(self._git_ref)
         shutil.rmtree(os.path.join(self._output_dir, ".git"))
-
-    def generate_workflow_name(self) -> str:
-        """Generate a workflow name from the given repository URL.
-
-        The repository's name is used as the name for the workflow.
-        If a Git reference is provided, it is appended to the workflow name.
-
-        :returns: Generated workflow name.
-        """
-        repository_name = self._parsed_url.basename_without_extension
-        if self._git_ref:
-            workflow_name = f"{repository_name}-{self._git_ref}"
-        else:
-            workflow_name = repository_name
-        return self._clean_workflow_name(workflow_name)
 
 
 class WorkflowFetcherYaml(WorkflowFetcherBase):
@@ -269,24 +343,7 @@ class WorkflowFetcherYaml(WorkflowFetcherBase):
         workflow_spec_path = os.path.join(self._output_dir, self._spec)
         self._download_file(self._parsed_url.original_url, workflow_spec_path)
 
-    def generate_workflow_name(self) -> str:
-        """Generate a workflow name from the given URL to the YAML specification file.
-
-        The workflow name is the path to the YAML specification file.
-
-        :returns: Generated workflow name.
-        """
-        workflow_name = None
-        if self._parsed_url.basename in WORKFLOW_SPEC_FILENAMES:
-            # We omit the name of the specification file if it is standard
-            # (e.g. `reana.yaml` or `reana.yml`)
-            workflow_name = self._clean_workflow_name(self._parsed_url.dirname)
-        if not workflow_name:
-            workflow_name = self._clean_workflow_name(
-                f"{self._parsed_url.dirname}-{self._parsed_url.basename_without_extension}"
-            )
-        return workflow_name
-
+# ParsedURL returns fetcher
 
 class WorkflowFetcherZip(WorkflowFetcherBase):
     """Fetch the specification of a workflow from a zip archive."""
@@ -325,63 +382,54 @@ class WorkflowFetcherZip(WorkflowFetcherBase):
                     shutil.move(os.path.join(top_level_dir, entry), self._output_dir)
                 os.rmdir(top_level_dir)
 
-    def generate_workflow_name(self) -> str:
-        """Generate a workflow name from the given URL to the zip archive.
 
-        The name of the zip archive is used as the name of the workflow.
-
-        :returns: Generated workflow name.
-        """
-        return self._clean_workflow_name(self._parsed_url.basename_without_extension)
-
-
-def _get_github_fetcher(
-    parsed_url: ParsedUrl, output_dir: str, spec: Optional[str] = None
-) -> WorkflowFetcherGit:
-    """Parse a GitHub URL and return the correct fetcher.
-
-    :param parsed_url: Parsed URL to a GitHub repository.
-    :param output_dir: Directory where all the data fetched will be saved.
-    :param spec: Optional path to the workflow specification.
-    :returns: Workflow fetcher.
-    """
-    # There are four different GitHub URLs:
-    # 1. URL to a repository: /<user>/<repo>
-    # 2. URL to a branch/commit: /<user>/<repo>/tree/<git_ref>
-    # 3. URL to a specific folder: /<user>/<repo>/tree/<git_ref>/<path_to_dir>
-    # 4. URL to a specific file: /<user>/<repo>/blob/<git_ref>/<path_to_file>
-
-    # We are interested in five components: username, repository, tree/blob, git_ref, path
-    url_path_components = ["username", "repository", "tree_or_blob", "git_ref", "path"]
-    split_url_path = parsed_url.path.strip("/").split(
-        "/", maxsplit=len(url_path_components) - 1
-    )
-    components = {k: v for k, v in zip(url_path_components, split_url_path)}
-
-    username = components.get("username")
-    repository = components.get("repository")
-    tree_or_blob = components.get("tree_or_blob")
-    git_ref = components.get("git_ref")
-    path = components.get("path")
-
-    if not username:
-        raise ValueError("Username not provided in GitHub URL")
-    if not repository:
-        raise ValueError("Repository not provided in GitHub URL")
-    if tree_or_blob and tree_or_blob not in ["tree", "blob"]:
-        raise ValueError("Malformed GitHub URL")
-    if tree_or_blob and not git_ref:
-        raise ValueError("Branch or commit ID not provided in GitHub URL")
-    if tree_or_blob == "blob":
-        raise ValueError(
-            "GitHub URL points directly to a file. "
-            "Use the 'spec' argument to specify a particular specification file"
-        )
-    if tree_or_blob == "tree" and path:
-        raise ValueError("GitHub URL points to a directory")
-
-    repository_url = ParsedUrl(f"https://github.com/{username}/{repository}.git")
-    return WorkflowFetcherGit(repository_url, output_dir, git_ref, spec)
+# def _get_github_fetcher(
+#     parsed_url: ParsedUrl, output_dir: str, spec: Optional[str] = None
+# ) -> WorkflowFetcherGit:
+#     """Parse a GitHub URL and return the correct fetcher.
+#
+#     :param parsed_url: Parsed URL to a GitHub repository.
+#     :param output_dir: Directory where all the data fetched will be saved.
+#     :param spec: Optional path to the workflow specification.
+#     :returns: Workflow fetcher.
+#     """
+#     # There are four different GitHub URLs:
+#     # 1. URL to a repository: /<user>/<repo>
+#     # 2. URL to a branch/commit: /<user>/<repo>/tree/<git_ref>
+#     # 3. URL to a specific folder: /<user>/<repo>/tree/<git_ref>/<path_to_dir>
+#     # 4. URL to a specific file: /<user>/<repo>/blob/<git_ref>/<path_to_file>
+#
+#     # We are interested in five components: username, repository, tree/blob, git_ref, path
+#     url_path_components = ["username", "repository", "tree_or_blob", "git_ref", "path"]
+#     split_url_path = parsed_url.path.strip("/").split(
+#         "/", maxsplit=len(url_path_components) - 1
+#     )
+#     components = {k: v for k, v in zip(url_path_components, split_url_path)}
+#
+#     username = components.get("username")
+#     repository = components.get("repository")
+#     tree_or_blob = components.get("tree_or_blob")
+#     git_ref = components.get("git_ref")
+#     path = components.get("path")
+#
+#     if not username:
+#         raise ValueError("Username not provided in GitHub URL")
+#     if not repository:
+#         raise ValueError("Repository not provided in GitHub URL")
+#     if tree_or_blob and tree_or_blob not in ["tree", "blob"]:
+#         raise ValueError("Malformed GitHub URL")
+#     if tree_or_blob and not git_ref:
+#         raise ValueError("Branch or commit ID not provided in GitHub URL")
+#     if tree_or_blob == "blob":
+#         raise ValueError(
+#             "GitHub URL points directly to a file. "
+#             "Use the 'spec' argument to specify a particular specification file"
+#         )
+#     if tree_or_blob == "tree" and path:
+#         raise ValueError("GitHub URL points to a directory")
+#
+#     repository_url = ParsedUrl(f"https://github.com/{username}/{repository}.git")
+#     return WorkflowFetcherGit(repository_url, output_dir, git_ref, spec)
 
 
 def get_fetcher(
@@ -406,12 +454,13 @@ def get_fetcher(
                 "The provided specification doesn't have a valid file extension"
             )
 
+    if parsed_url.netloc == "github.com":
+        parsed_url = GitHubParsedUrl(launcher_url)
+
     if parsed_url.extension == ".git":
         return WorkflowFetcherGit(parsed_url, output_dir, spec=spec)
     elif parsed_url.extension == ".zip":
-        return WorkflowFetcherZip(parsed_url, output_dir, spec)
-    elif parsed_url.netloc == "github.com":
-        return _get_github_fetcher(parsed_url, output_dir, spec)
+        return WorkflowFetcherZip(parsed_url, output_dir, spec=spec)
     elif parsed_url.extension in WORKFLOW_SPEC_EXTENSIONS:
         if spec:
             raise ValueError(
